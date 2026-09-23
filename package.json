@@ -1,0 +1,15 @@
+{
+  "name": "irrad-witness-ledger",
+  "version": "1.0.0",
+  "description": "辐照实验剂量见证台账：哈希链、幂等、跨标签页串行裁决与断链隔离",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js",
+    "verify": "node verify/verify.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

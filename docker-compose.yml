@@ -1,0 +1,33 @@
+services:
+  app:
+    build: .
+    image: irrad-witness-ledger:latest
+    environment:
+      # 可配置宿主端口：HOST_PORT 在宿主机映射，容器内固定监听 8080
+      HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+    restart: unless-stopped
+
+  # 单次验收服务：复算并发幂等、异参冲突、断链边界，
+  # 执行代码测试、构建检查和 HTTP 冒烟，按退出码结束（不常驻）。
+  verify:
+    build: .
+    image: irrad-witness-ledger:latest
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # 对 app 容器做一次真实 HTTP 冒烟
+      APP_URL: "http://app:8080"
+      SMOKE_PORT: "8091"
+    # 单次运行：成功退出 0 / 失败非 0，不 restart
+    command: ["node", "verify/verify.js"]
+    restart: "no"

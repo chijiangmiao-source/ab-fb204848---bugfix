@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>辐照实验剂量见证台账</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>辐照实验剂量见证台账</h1>
+    <p class="sub">哈希链式补录 · 跨标签页串行裁决 · 断链自动隔离</p>
+  </header>
+
+  <div id="freezeBanner" class="banner banner-danger" hidden>
+    <strong>检测到断链，已冻结追加。</strong>
+    <span id="freezeDetail"></span>
+  </div>
+
+  <main>
+    <section class="card" aria-labelledby="h-status">
+      <h2 id="h-status">链状态</h2>
+      <dl class="status-grid">
+        <div><dt>状态</dt><dd id="chainStatus">—</dd></div>
+        <div><dt>下一条序号</dt><dd id="nextSeq">—</dd></div>
+        <div><dt>最后可信链头</dt><dd id="headSeq">—</dd></div>
+        <div><dt>前序摘要</dt><dd id="prevDigest" class="mono">—</dd></div>
+      </dl>
+      <button id="btnReverify" type="button" class="btn btn-ghost">从创世记录复算全链</button>
+      <span id="reverifyMsg" class="inline-msg"></span>
+    </section>
+
+    <section class="card" aria-labelledby="h-form">
+      <h2 id="h-form">剂量补录</h2>
+      <form id="ledgerForm">
+        <label>仪器
+          <input name="instrument" required maxlength="64" autocomplete="off" placeholder="如：电子加速器 ACC-01" />
+        </label>
+        <label>整数剂量（Gy）
+          <input name="dose" type="number" min="0" step="1" required inputmode="numeric" placeholder="如：25" />
+        </label>
+        <label>操作人
+          <input name="operator" required maxlength="64" autocomplete="off" placeholder="如：张工" />
+        </label>
+        <label>操作标识（幂等键）
+          <input name="opId" required maxlength="80" autocomplete="off" placeholder="同一标识同内容重试返回原记录" />
+        </label>
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary" id="btnSubmit">提交</button>
+        </div>
+        <p id="formError" class="form-error" role="alert" hidden></p>
+        <p class="preview">
+          当前表单摘要（预览，未落库）：<span id="previewDigest" class="mono">—</span>
+        </p>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="h-tab">
+      <h2 id="h-tab">本标签页提交状态</h2>
+      <p class="hint">仅显示当前标签页的提交；标记为“排队中/写入中”的记录在刷新或关闭后按链上复算结果裁决。</p>
+      <ul id="tabQueue" class="tab-queue">
+        <li class="empty">本标签页暂无提交</li>
+      </ul>
+    </section>
+
+    <section class="card" aria-labelledby="h-ledger">
+      <h2 id="h-ledger">见证记录</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>序号</th><th>仪器</th><th>剂量(Gy)</th><th>操作人</th>
+              <th>操作标识</th><th>前序摘要</th><th>本条摘要</th>
+            </tr>
+          </thead>
+          <tbody id="chainBody"></tbody>
+        </table>
+      </div>
+      <h3 id="h-suffix" class="suffix-title" hidden>隔离后缀（禁止继续追加）</h3>
+      <div class="table-wrap" id="suffixWrap" hidden>
+        <table>
+          <thead>
+            <tr>
+              <th>原序号</th><th>仪器</th><th>剂量(Gy)</th><th>操作人</th>
+              <th>操作标识</th><th>前序摘要</th><th>本条摘要</th>
+            </tr>
+          </thead>
+          <tbody id="suffixBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>标签页：<span id="peerId" class="mono"></span></span>
+    <span id="lastEvent" class="inline-msg"></span>
+  </footer>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
