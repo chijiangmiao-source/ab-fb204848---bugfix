@@ -60,7 +60,7 @@ async function stepScenarios() {
 
 async function stepTests() {
   section('2/4 代码测试（node --test）');
-  const r = await run(process.execPath, ['--test', 'test/chain.test.js', 'test/storage.test.js']);
+  const r = await run(process.execPath, ['--test', 'test/chain.test.js', 'test/storage.test.js', 'test/isolation.test.js']);
   const lines = r.stdout.split('\n');
   const summary = lines.filter((l) => l.startsWith('# ')).join('\n');
   console.log(summary.split('\n').map((l) => `  ${l}`).join('\n'));

@@ -209,11 +209,152 @@ async function scenarioCrashAtomicity() {
   reopened.stop();
 }
 
+const CRASH_FAST = { lockTtlMs: 60, heartbeatMs: 20, stabilizeMs: 1, pollMs: 3 };
+
+async function scenarioIsolationCrashRecovery() {
+  // 五条连续记录，第三条剂量改动而不更新摘要。
+  const seedBackend = newBackend();
+  const seeder = tab(seedBackend, 'seed', { timing: CRASH_FAST });
+  await seeder.start();
+  for (let i = 0; i < 5; i += 1) await seeder.submit(rec(`q-${i}`, i + 1));
+  seeder.stop();
+  seedBackend.map.delete(STORAGE_KEYS.K_LOCK);
+  const blocks = read(seedBackend, STORAGE_KEYS.K_CHAIN, []);
+  blocks[2] = { ...blocks[2], dose: 888 };
+
+  // 隔离状态机的每个落盘边界：(键, 第几次出现)。
+  const boundaries = [
+    ['P0 计划', STORAGE_KEYS.K_QUARANTINE, 1],
+    ['P1 后缀', STORAGE_KEYS.K_SUFFIX, 1],
+    ['P2 主链截断', STORAGE_KEYS.K_CHAIN, 1],
+    ['P3 意图清空', STORAGE_KEYS.K_INTENTS, 1],
+    ['P4 终态标记', STORAGE_KEYS.K_QUARANTINE, 2],
+  ];
+
+  for (const [label, dieKey, occurrence] of boundaries) {
+    // 每个边界用同一份损坏初态的独立副本。
+    const backend = newBackend();
+    for (const [k, v] of seedBackend.map) backend.map.set(k, v);
+    backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(blocks));
+
+    const seen = Object.create(null);
+    const dying = tab(backend, 'dying', {
+      timing: CRASH_FAST,
+      onAfterWrite: ({ key }) => {
+        seen[key] = (seen[key] || 0) + 1;
+        return key === dieKey && seen[key] === occurrence ? 'die' : undefined;
+      },
+    });
+    let died = null;
+    try { await dying.start(); } catch (e) { died = e.code; }
+    check(`隔离崩溃恢复[${label}]：写后模拟关闭`, died === 'TAB_CLOSED', `got=${died}`);
+
+    // 关闭后、新实例持锁复算前：只读视图不得自相矛盾
+    // （旧缺陷：主表仍展示 1..5 而隔离后缀为空）。
+    const viewer = tab(backend, 'viewer', { timing: CRASH_FAST });
+    const projected = viewer.readState();
+    check(`隔离崩溃恢复[${label}]：关闭后视图投影可信前缀 2 条`,
+      projected.status === 'frozen' && projected.chain.length === 2
+      && projected.head.seq === 2,
+      `status=${projected.status} len=${projected.chain.length}`);
+    check(`隔离崩溃恢复[${label}]：关闭后视图投影坏后缀 3 条且为原始损坏字节`,
+      projected.suffix.length === 3
+      && projected.suffix[0].seq === 3
+      && projected.suffix[0].dose === 888
+      && projected.suffix[0].digest === blocks[2].digest,
+      `suffix=${projected.suffix.length}`);
+    viewer.stop();
+
+    // 新实例启动：未完成隔离必须收敛到同一终态。
+    const reopened = tab(backend, 'reopened', { timing: CRASH_FAST });
+    const state = await reopened.start();
+    const ok = state.status === 'frozen'
+      && state.quarantine.firstBadSeq === 3
+      && state.quarantine.reason === 'digest-mismatch'
+      && state.quarantine.phase === undefined
+      && state.chain.length === 2
+      && state.suffix.length === 3
+      && state.head.seq === 2
+      && state.head.digest === blocks[1].digest;
+    check(`隔离崩溃恢复[${label}]：重开收敛（前缀2/后缀3/首坏3/链头#2）`, ok,
+      JSON.stringify({
+        status: state.status,
+        firstBadSeq: state.quarantine && state.quarantine.firstBadSeq,
+        prefix: state.chain.length,
+        suffix: state.suffix.length,
+        head: state.head && state.head.seq,
+      }));
+    check(`隔离崩溃恢复[${label}]：坏后缀原始字节完整保留`,
+      JSON.stringify(state.suffix) === JSON.stringify(blocks.slice(2)));
+    check(`隔离崩溃恢复[${label}]：可信前缀独立复算通过`,
+      independentRecompute(state.chain).ok && state.chain.length === 2);
+    check(`隔离崩溃恢复[${label}]：终态标记已落盘且无残留计划`,
+      JSON.parse(backend.map.get(STORAGE_KEYS.K_QUARANTINE)).phase === undefined
+      && backend.map.get(STORAGE_KEYS.K_INTENTS) === '[]');
+
+    let frozenCode = null;
+    try { await reopened.submit(rec('after', 1)); }
+    catch (e) { frozenCode = e instanceof LedgerError ? e.code : 'OTHER'; }
+    check(`隔离崩溃恢复[${label}]：持续禁止追加`, frozenCode === 'FROZEN', `got=${frozenCode}`);
+
+    // 再次复算与再次重开都不改变结论。
+    const again = await reopened.reverify();
+    check(`隔离崩溃恢复[${label}]：再次复算结论稳定`,
+      again.status === 'frozen' && again.quarantine.firstBadSeq === 3
+      && again.chain.length === 2 && again.suffix.length === 3
+      && again.head.digest === blocks[1].digest);
+    reopened.stop();
+  }
+
+  // 三类断链都必须在 P0（最早的隔离边界）中断后正确收敛。
+  const variants = [
+    ['内容被改', (c) => { c[2] = { ...c[2], dose: 888 }; }, 'digest-mismatch', 3],
+    ['记录缺失', (c) => { c.splice(2, 1); }, 'seq-gap', 2],
+    ['摘要不符', (c) => { c[2] = { ...c[2], digest: 'f'.repeat(64) }; }, 'digest-mismatch', 3],
+  ];
+  for (const [vlabel, damage, reason, suffixLen] of variants) {
+    const backend = newBackend();
+    for (const [k, v] of seedBackend.map) backend.map.set(k, v);
+    const damaged = read(backend, STORAGE_KEYS.K_CHAIN, []);
+    damage(damaged);
+    backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(damaged));
+
+    const seen = Object.create(null);
+    const dying = tab(backend, 'dying', {
+      timing: CRASH_FAST,
+      onAfterWrite: ({ key }) => {
+        seen[key] = (seen[key] || 0) + 1;
+        return key === STORAGE_KEYS.K_QUARANTINE && seen[key] === 1 ? 'die' : undefined;
+      },
+    });
+    await dying.start().catch(() => {});
+    const reopened = tab(backend, 'reopened', { timing: CRASH_FAST });
+    const state = await reopened.start();
+    check(`隔离崩溃恢复[${vlabel}@P0]：首坏 3 / 原因 / 前缀 2 / 后缀条数`,
+      state.status === 'frozen'
+      && state.quarantine.firstBadSeq === 3
+      && state.quarantine.reason === reason
+      && state.chain.length === 2
+      && state.suffix.length === suffixLen
+      && state.head.seq === 2,
+      JSON.stringify({
+        reason: state.quarantine && state.quarantine.reason,
+        suffix: state.suffix.length,
+      }));
+    let frozenCode = null;
+    try { await reopened.submit(rec('after', 1)); }
+    catch (e) { frozenCode = e.code; }
+    check(`隔离崩溃恢复[${vlabel}@P0]：禁止追加`, frozenCode === 'FROZEN', `got=${frozenCode}`);
+    reopened.stop();
+  }
+}
+
 export async function runScenarios() {
   await scenarioConcurrentIdempotency();
   await scenarioConflict();
   await scenarioBreakBoundary();
   await scenarioTailMissing();
   await scenarioCrashAtomicity();
+  await scenarioIsolationCrashRecovery();
   return results;
 }
