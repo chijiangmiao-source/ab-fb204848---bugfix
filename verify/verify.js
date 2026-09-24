@@ -53,7 +53,7 @@ function run(cmd, args, opts = {}) {
 }
 
 async function stepScenarios() {
-  section('1/4 场景复算（并发幂等 / 异参冲突 / 断链边界 / 崩溃原子性）');
+  section('1/4 场景复算（并发幂等 / 异参冲突 / 断链边界 / 崩溃原子性 / 隔离中断恢复）');
   const checks = await runScenarios();
   for (const c of checks) report(c.name, c.ok, c.detail);
 }

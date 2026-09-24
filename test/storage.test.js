@@ -388,3 +388,205 @@ test('锚点 JSON 损坏：冻结在下一序号，保留全部可信记录', as
   assert.equal(state.head.seq, 3);
   tab.stop();
 });
+
+// ---------- 隔离过程被中断后的可恢复性 ----------
+
+const ISOLATION_BOUNDARIES = ['isolate-plan', 'isolate-suffix', 'isolate-chain', 'isolate-intents', 'isolate-final'];
+
+// 三类断链：内容被改、记录缺失、摘要不符。返回首个坏序号与隔离后应观察到的后缀序号。
+function damageChain(backend, kind) {
+  const chain = JSON.parse(backend.map.get(STORAGE_KEYS.K_CHAIN));
+  if (kind === 'content') {
+    // 改第 3 条剂量但不更新摘要
+    chain[2] = { ...chain[2], dose: 888 };
+    backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(chain));
+    return { firstBadSeq: 3, reason: 'digest-mismatch', suffixSeqs: [3, 4, 5] };
+  }
+  if (kind === 'missing') {
+    // 整体删除第 3 条（中间缺失），第 4、5 条前移
+    chain.splice(2, 1);
+    backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(chain));
+    return { firstBadSeq: 3, reason: 'seq-gap', suffixSeqs: [4, 5] };
+  }
+  if (kind === 'digest') {
+    // 直接改第 3 条摘要字段
+    chain[2] = { ...chain[2], digest: 'f'.repeat(64) };
+    backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(chain));
+    return { firstBadSeq: 3, reason: 'digest-mismatch', suffixSeqs: [3, 4, 5] };
+  }
+  throw new Error(`未知断链类型: ${kind}`);
+}
+
+async function crashIsolationAndReopen(boundary, kind) {
+  const backend = await seedChain(5);
+  const expectedHeadDigest = JSON.parse(backend.map.get(STORAGE_KEYS.K_CHAIN))[1].digest;
+  const expect = damageChain(backend, kind);
+
+  // 隔离在指定本地持久化边界落库后立即“关闭标签页”。
+  const dying = makeTab(backend, 'dying', {
+    timing: CRASH_TTL,
+    onAfterWrite: (info) => (info.boundary === boundary ? 'die' : undefined),
+  });
+  await dying.start().then(
+    () => { throw new Error('预期标签页在隔离窗口中被终止'); },
+    (err) => assert.equal(err.code, 'TAB_CLOSED'),
+  );
+
+  // 新实例（= 重新打开标签页）启动后核对同一结果。
+  const reopened = makeTab(backend, 'reopen', { timing: CRASH_TTL });
+  const state = await reopened.start();
+  return { backend, reopened, state, expect, expectedHeadDigest };
+}
+
+for (const kind of ['content', 'missing', 'digest']) {
+  for (const boundary of ISOLATION_BOUNDARIES) {
+    test(`隔离中断恢复（${kind}，崩溃于 ${boundary}）：可信前缀/隔离后缀/首坏序号/链头一致`, async () => {
+      const { backend, reopened, state, expect, expectedHeadDigest } = await crashIsolationAndReopen(boundary, kind);
+
+      // 未完成的隔离不能被当成已完成：新实例启动后必须已收敛到最终冻结态。
+      assert.equal(state.status, 'frozen');
+      assert.equal(state.quarantine.phase, undefined);
+      assert.equal(state.quarantine.firstBadSeq, expect.firstBadSeq);
+      assert.equal(state.quarantine.reason, expect.reason);
+
+      // 可信主表只保留第 1、2 条；坏后缀完整进入隔离区（缺失类下仅含尚存记录）。
+      assert.deepEqual(state.chain.map((b) => b.seq), [1, 2]);
+      assert.deepEqual(state.suffix.map((b) => b.seq), expect.suffixSeqs);
+      // 原始坏后缀内容不丢失：第 3 条的篡改内容仍可在隔离区看到。
+      if (kind === 'content') {
+        assert.equal(state.suffix[0].dose, 888);
+      }
+
+      // 最后可信链头仍是第 2 条，其摘要与隔离前一致。
+      assert.ok(state.head);
+      assert.equal(state.head.seq, 2);
+      assert.equal(state.head.digest, expectedHeadDigest);
+
+      // 持续禁止追加。
+      await assert.rejects(() => reopened.submit(rec('after', 1)), (e) => e.code === 'FROZEN');
+
+      // 再次复算、再次重开都不纠正/解冻，结果稳定。
+      const reverified = await reopened.reverify();
+      assert.equal(reverified.status, 'frozen');
+      assert.deepEqual(reverified.chain.map((b) => b.seq), [1, 2]);
+      assert.deepEqual(reverified.suffix.map((b) => b.seq), expect.suffixSeqs);
+
+      const again = makeTab(backend, 'again', { timing: CRASH_TTL });
+      const state2 = await again.start();
+      assert.equal(state2.status, 'frozen');
+      assert.equal(state2.quarantine.firstBadSeq, 3);
+      assert.deepEqual(state2.chain.map((b) => b.seq), [1, 2]);
+      assert.deepEqual(state2.suffix.map((b) => b.seq), expect.suffixSeqs);
+      assert.equal(state2.head.seq, 2);
+      assert.equal(state2.head.digest, state.head.digest);
+      await assert.rejects(() => again.submit(rec('after2', 1)), (e) => e.code === 'FROZEN');
+
+      // 持久化层无“隔离中”残留标记、无孤儿意图。
+      const marker = JSON.parse(backend.map.get(STORAGE_KEYS.K_QUARANTINE));
+      assert.equal(marker.phase, undefined);
+      assert.equal(backend.map.get(STORAGE_KEYS.K_INTENTS), '[]');
+      reopened.stop();
+      again.stop();
+    });
+  }
+}
+
+test('隔离中断恢复：无中断时一次走完，最终态与中断恢复一致', async () => {
+  const backend = await seedChain(5);
+  damageChain(backend, 'content');
+  const tab = makeTab(backend, 'clean', { timing: CRASH_TTL });
+  const state = await tab.start();
+  assert.equal(state.status, 'frozen');
+  assert.deepEqual(state.chain.map((b) => b.seq), [1, 2]);
+  assert.deepEqual(state.suffix.map((b) => b.seq), [3, 4, 5]);
+  assert.equal(state.quarantine.firstBadSeq, 3);
+  assert.equal(state.head.seq, 2);
+  assert.equal(state.quarantine.phase, undefined);
+  tab.stop();
+});
+
+test('隔离中断：原标签页崩溃后，仍开着的其它标签页经 storage 事件把隔离续做完', async () => {
+  // 先在健康链上启动旁观者，再“无声”改坏第 3 条（直接写后端，不向观察者派发事件），
+  // 保证由随后崩溃的标签页发起隔离，旁观者仅通过它的隔离落库事件学会续做。
+  const backend = await seedChain(5);
+  let markFrozen;
+  const frozenViaEvent = new Promise((resolve) => { markFrozen = resolve; });
+  const watcher = makeTab(backend, 'watcher', {
+    timing: CRASH_TTL,
+    onExternalChange: (s) => { if (s.status === 'frozen') markFrozen(); },
+  });
+  await watcher.start();
+  assert.equal(watcher.readState().status, 'ready');
+
+  // 直接改后端 Map：旁观者收不到本次事件，只有稍后持锁的隔离者会复算出损坏。
+  const healthy = JSON.parse(backend.map.get(STORAGE_KEYS.K_CHAIN));
+  healthy[2] = { ...healthy[2], dose: 888 };
+  backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(healthy));
+
+  const dying = makeTab(backend, 'dying', {
+    timing: CRASH_TTL,
+    onAfterWrite: (info) => (info.boundary === 'isolate-plan' ? 'die' : undefined),
+  });
+  await dying.start().then(
+    () => { throw new Error('预期隔离标签页被终止'); },
+    (err) => assert.equal(err.code, 'TAB_CLOSED'),
+  );
+
+  // 旁观者收到隔离落库事件 -> 等待死锁 TTL 后持锁续做 -> 收敛到最终冻结态。
+  await frozenViaEvent;
+  const state = watcher.readState();
+  assert.equal(state.status, 'frozen');
+  assert.deepEqual(state.chain.map((b) => b.seq), [1, 2]);
+  assert.deepEqual(state.suffix.map((b) => b.seq), [3, 4, 5]);
+  assert.equal(state.quarantine.firstBadSeq, 3);
+  watcher.stop();
+});
+
+test('隔离标记损坏（截断前）：重开从完整坏链重新隔离，不丢后缀', async () => {
+  const backend = await seedChain(5);
+  damageChain(backend, 'content');
+  // 隔离只写了“隔离中”计划标记就崩溃（主链未截断、后缀未写）。
+  const dying = makeTab(backend, 'dying', {
+    timing: CRASH_TTL,
+    onAfterWrite: (info) => (info.boundary === 'isolate-plan' ? 'die' : undefined),
+  });
+  await dying.start().catch(() => {});
+  // 随后“隔离中”标记本身也损坏了。
+  backend.map.set(STORAGE_KEYS.K_QUARANTINE, '{broken');
+
+  const reopened = makeTab(backend, 'reopen', { timing: CRASH_TTL });
+  const s = await reopened.start();
+  assert.equal(s.status, 'frozen');
+  assert.deepEqual(s.chain.map((b) => b.seq), [1, 2]);
+  assert.deepEqual(s.suffix.map(b => b.seq), [3, 4, 5]);
+  assert.equal(s.quarantine.firstBadSeq, 3);
+  assert.equal(s.head.seq, 2);
+  reopened.stop();
+});
+
+test('隔离标记损坏（截断后）：主链已是健康前缀，保留已落库的完整后缀', async () => {
+  const backend = await seedChain(5);
+  damageChain(backend, 'content');
+  // 隔离走到“截断主链”后崩溃：后缀 3 条与前缀 2 条均已落库，但最终标记还没写。
+  const dying = makeTab(backend, 'dying', {
+    timing: CRASH_TTL,
+    onAfterWrite: (info) => (info.boundary === 'isolate-chain' ? 'die' : undefined),
+  });
+  await dying.start().catch(() => {});
+  assert.equal(JSON.parse(backend.map.get(STORAGE_KEYS.K_CHAIN)).length, 2);
+  assert.equal(JSON.parse(backend.map.get(STORAGE_KEYS.K_SUFFIX)).length, 3);
+  // 随后“隔离中”标记本身也损坏了。
+  backend.map.set(STORAGE_KEYS.K_QUARANTINE, '{broken');
+
+  const reopened = makeTab(backend, 'reopen', { timing: CRASH_TTL });
+  const s = await reopened.start();
+  assert.equal(s.status, 'frozen');
+  assert.deepEqual(s.chain.map((b) => b.seq), [1, 2]);
+  assert.deepEqual(s.suffix.map((b) => b.seq), [3, 4, 5]);
+  // 不能被锚点领先（截断后锚点仍指向 #5）误判成 tail-missing 而冲掉后缀。
+  assert.equal(s.quarantine.firstBadSeq, 3);
+  assert.equal(s.quarantine.reason, 'quarantine-rebuilt');
+  assert.equal(s.head.seq, 2);
+  await assert.rejects(() => reopened.submit(rec('x', 1)), (e) => e.code === 'FROZEN');
+  reopened.stop();
+});

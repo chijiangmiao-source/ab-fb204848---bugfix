@@ -69,11 +69,13 @@ let ledger;
 
 async function render() {
   const state = ledger.readState();
-  const frozen = state.status === 'frozen';
+  const frozen = state.status === 'frozen' || state.status === 'isolating';
 
-  $('#chainStatus').textContent = frozen
-    ? `已冻结（${reasonText[state.quarantine.reason] || state.quarantine.reason}）`
-    : state.status === 'unreadable' ? '存储不可读' : '正常';
+  $('#chainStatus').textContent = state.status === 'isolating'
+    ? '隔离恢复中（上次隔离被中断，正在续做）'
+    : frozen
+      ? `已冻结（${reasonText[state.quarantine.reason] || state.quarantine.reason}）`
+      : state.status === 'unreadable' ? '存储不可读' : '正常';
   $('#chainStatus').style.color = frozen ? 'var(--danger)' : 'var(--ok)';
   $('#nextSeq').textContent = frozen ? '—' : state.nextSeq;
   $('#headSeq').textContent = state.head ? `#${state.head.seq}` : '（创世）';
@@ -160,7 +162,7 @@ function reconcileTabQueue(state) {
       item.status = 'committed';
       item.seq = block.seq;
       changed = true;
-    } else if (state.status === 'frozen') {
+    } else if (state.status === 'frozen' || state.status === 'isolating') {
       item.status = 'frozen';
       item.error = '断链冻结中，未追加';
       changed = true;
@@ -236,7 +238,8 @@ async function boot() {
       $('#formError').textContent = item.error;
       $('#formError').hidden = false;
     } finally {
-      $('#btnSubmit').disabled = ledger.readState().status === 'frozen';
+      const s = ledger.readState().status;
+      $('#btnSubmit').disabled = s === 'frozen' || s === 'isolating';
       saveTabQueue(tabQueue);
       renderTabQueue();
       await render();

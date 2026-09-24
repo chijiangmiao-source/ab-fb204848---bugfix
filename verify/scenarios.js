@@ -8,6 +8,10 @@ import { GENESIS_DIGEST } from '../lib/chain.js';
 import { MemoryTabStorage } from '../test/helpers/memory-store.js';
 
 const FAST = { lockTtlMs: 500, heartbeatMs: 120, stabilizeMs: 2, pollMs: 4 };
+const CRASH = { lockTtlMs: 60, heartbeatMs: 20, stabilizeMs: 1, pollMs: 3 };
+
+// 隔离协议的全部本地持久化边界。
+const ISOLATION_BOUNDARIES = ['isolate-plan', 'isolate-suffix', 'isolate-chain', 'isolate-intents', 'isolate-final'];
 
 function rec(opId, dose = 25) {
   return { instrument: 'ACC-01', dose, operator: '张工', opId };
@@ -209,11 +213,95 @@ async function scenarioCrashAtomicity() {
   reopened.stop();
 }
 
+// 断链的三类成因：内容被改 / 记录缺失 / 摘要不符。
+function damageForIsolation(backend, kind) {
+  const chain = read(backend, STORAGE_KEYS.K_CHAIN, []);
+  if (kind === 'content') {
+    chain[2] = { ...chain[2], dose: 888 };
+    backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(chain));
+    return { firstBadSeq: 3, reason: 'digest-mismatch', suffixSeqs: [3, 4, 5] };
+  }
+  if (kind === 'missing') {
+    chain.splice(2, 1);
+    backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(chain));
+    return { firstBadSeq: 3, reason: 'seq-gap', suffixSeqs: [4, 5] };
+  }
+  chain[2] = { ...chain[2], digest: 'f'.repeat(64) };
+  backend.map.set(STORAGE_KEYS.K_CHAIN, JSON.stringify(chain));
+  return { firstBadSeq: 3, reason: 'digest-mismatch', suffixSeqs: [3, 4, 5] };
+}
+
+async function scenarioIsolationCrashRecovery() {
+  for (const kind of ['content', 'missing', 'digest']) {
+    for (const boundary of ISOLATION_BOUNDARIES) {
+      const backend = newBackend();
+      const seeder = tab(backend, 'seed', { timing: CRASH });
+      await seeder.start();
+      for (let i = 0; i < 5; i += 1) await seeder.submit(rec(`b-${i}`, i + 1));
+      seeder.stop();
+      backend.map.delete(STORAGE_KEYS.K_LOCK);
+      const head2Digest = read(backend, STORAGE_KEYS.K_CHAIN, [])[1].digest;
+      const expect = damageForIsolation(backend, kind);
+
+      // 在隔离协议的每个本地持久化边界模拟标签页当场关闭。
+      const dying = tab(backend, 'dying', {
+        timing: CRASH,
+        onAfterWrite: (info) => (info.boundary === boundary ? 'die' : undefined),
+      });
+      let died = null;
+      try { await dying.start(); } catch (e) { died = e instanceof LedgerError ? e.code : 'OTHER'; }
+
+      // 新实例启动后必须收敛到同一结果。
+      const reopened = tab(backend, 'reopen', { timing: CRASH });
+      const state = await reopened.start();
+      const tag = `${kind}@${boundary}`;
+      check(`隔离恢复[${tag}]：隔离者确实被终止`, died === 'TAB_CLOSED', `got=${died}`);
+      check(`隔离恢复[${tag}]：收敛为最终冻结（非隔离中）`,
+        state.status === 'frozen' && state.quarantine.phase === undefined, state.status);
+      check(`隔离恢复[${tag}]：首个坏序号=${expect.firstBadSeq}(${expect.reason})`,
+        state.quarantine.firstBadSeq === expect.firstBadSeq
+        && state.quarantine.reason === expect.reason,
+        `${state.quarantine.firstBadSeq}/${state.quarantine.reason}`);
+      check(`隔离恢复[${tag}]：可信主表只剩 #1,#2`,
+        JSON.stringify(state.chain.map((b) => b.seq)) === '[1,2]');
+      check(`隔离恢复[${tag}]：坏后缀完整进入隔离区`,
+        JSON.stringify(state.suffix.map((b) => b.seq)) === JSON.stringify(expect.suffixSeqs));
+      check(`隔离恢复[${tag}]：最后可信链头仍为 #2 且摘要不变`,
+        state.head && state.head.seq === 2 && state.head.digest === head2Digest);
+
+      let frozenCode = null;
+      try { await reopened.submit(rec('after-break', 1)); } catch (e) { frozenCode = e.code; }
+      check(`隔离恢复[${tag}]：持续禁止追加`, frozenCode === 'FROZEN', `got=${frozenCode}`);
+
+      // 再次复算 / 再次重开都不改变结果。
+      const reverified = await reopened.reverify();
+      check(`隔离恢复[${tag}]：再次复算不纠正/不解冻`,
+        reverified.status === 'frozen'
+        && reverified.chain.length === 2
+        && reverified.suffix.length === expect.suffixSeqs.length);
+      const again = tab(backend, 'again', { timing: CRASH });
+      const state2 = await again.start();
+      check(`隔离恢复[${tag}]：再次重开结果稳定`,
+        state2.status === 'frozen'
+        && state2.quarantine.firstBadSeq === 3
+        && state2.chain.length === 2
+        && state2.suffix.length === expect.suffixSeqs.length
+        && state2.head.digest === head2Digest);
+      check(`隔离恢复[${tag}]：无隔离中标记与孤儿意图残留`,
+        read(backend, STORAGE_KEYS.K_QUARANTINE, {}).phase === undefined
+        && backend.map.get(STORAGE_KEYS.K_INTENTS) === '[]');
+      reopened.stop();
+      again.stop();
+    }
+  }
+}
+
 export async function runScenarios() {
   await scenarioConcurrentIdempotency();
   await scenarioConflict();
   await scenarioBreakBoundary();
   await scenarioTailMissing();
   await scenarioCrashAtomicity();
+  await scenarioIsolationCrashRecovery();
   return results;
 }
